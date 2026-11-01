@@ -163,6 +163,22 @@ app.patch("/books/:id", async (req, res) => {
   res.json(result);
 });
 
+app.delete("/books/:id", async (req, res) => {
+  const { id } = req.params;
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid book id" });
+  }
+
+  const result = await bookCollection.deleteOne({ _id: new ObjectId(id) });
+
+  if (result.deletedCount === 0) {
+    return res.status(404).send({ message: "Book not found" });
+  }
+
+  res.json(result);
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running at ${PORT}`);
 });
