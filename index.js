@@ -163,6 +163,85 @@ app.patch("/books/:id", async (req, res) => {
   res.json(result);
 });
 
+app.delete("/books/:id", async (req, res) => {
+  const { id } = req.params;
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid book id" });
+  }
+
+  const result = await bookCollection.deleteOne({ _id: new ObjectId(id) });
+
+  if (result.deletedCount === 0) {
+    return res.status(404).send({ message: "Book not found" });
+  }
+
+  res.json(result);
+});
+
+app.post("/borrows", async (req, res) => {
+  const data = req.body || {};
+  const { bookId, userEmail, returnDate } = data;
+
+  if (!bookId || !ObjectId.isValid(bookId)) {
+    return res.status(400).send({ message: "Invalid or missing book id" });
+  }
+
+  if (!userEmail || String(userEmail).trim() === "") {
+    return res.status(400).send({ message: "User email is required" });
+  }
+
+  const book = await bookCollection.findOne({ _id: new ObjectId(bookId) });
+  if (!book) {
+    return res.status(404).send({ message: "Book not found" });
+  }
+
+  const parsedReturnDate = returnDate ? new Date(returnDate) : null;
+  const validReturnDate =
+    parsedReturnDate && !Number.isNaN(parsedReturnDate.getTime())
+      ? parsedReturnDate
+      : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+  const newBorrow = {
+    bookId: new ObjectId(bookId),
+    bookTitle: data.bookTitle ? String(data.bookTitle).trim() : book.title,
+    bookImage: data.bookImage ? String(data.bookImage).trim() : book.image,
+    userEmail: String(userEmail).trim(),
+    borrowDate: new Date(),
+    returnDate: validReturnDate,
+  };
+
+  const result = await borrowCollection.insertOne(newBorrow);
+  res.status(201).send(result);
+});
+
+app.get("/borrows", async (req, res) => {
+  const { email } = req.query;
+  const query = email ? { userEmail: email } : {};
+  const result = await borrowCollection
+    .find(query)
+    .sort({ borrowDate: -1 })
+    .toArray();
+
+  res.send(result);
+});
+
+app.delete("/borrows/:id", async (req, res) => {
+  const { id } = req.params;
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid borrow id" });
+  }
+
+  const result = await borrowCollection.deleteOne({ _id: new ObjectId(id) });
+
+  if (result.deletedCount === 0) {
+    return res.status(404).send({ message: "Borrow record not found" });
+  }
+
+  res.json(result);
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running at ${PORT}`);
 });
