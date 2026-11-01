@@ -215,6 +215,17 @@ app.post("/borrows", async (req, res) => {
   res.status(201).send(result);
 });
 
+app.get("/borrows", async (req, res) => {
+  const { email } = req.query;
+  const query = email ? { userEmail: email } : {};
+  const result = await borrowCollection
+    .find(query)
+    .sort({ borrowDate: -1 })
+    .toArray();
+
+  res.send(result);
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running at ${PORT}`);
 });
