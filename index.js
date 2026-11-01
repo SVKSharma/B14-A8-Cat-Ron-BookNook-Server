@@ -33,6 +33,7 @@ const bookCollection = db.collection("books");
 const borrowCollection = db.collection("borrows");
 
 const BOOK_CATEGORIES = ["Fiction", "Science", "History", "Kids", "Others"];
+const BOOK_UPDATE_FIELDS = ["title", "author", "category", "image", "description"];
 
 app.get("/", (req, res) => {
   res.send({ message: "Server is running fine!" });
@@ -110,6 +111,56 @@ app.post("/books", async (req, res) => {
 
   const result = await bookCollection.insertOne(newBook);
   res.status(201).send(result);
+});
+
+app.patch("/books/:id", async (req, res) => {
+  const { id } = req.params;
+  const data = req.body || {};
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid book id" });
+  }
+
+  const updates = {};
+
+  for (const field of BOOK_UPDATE_FIELDS) {
+    if (data[field] !== undefined && data[field] !== null) {
+      updates[field] = String(data[field]).trim();
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).send({
+      message: `Provide at least one field to update: ${BOOK_UPDATE_FIELDS.join(", ")}`,
+    });
+  }
+
+  const emptyFields = Object.entries(updates)
+    .filter(([, value]) => value === "")
+    .map(([field]) => field);
+
+  if (emptyFields.length > 0) {
+    return res.status(400).send({
+      message: `Fields cannot be empty: ${emptyFields.join(", ")}`,
+    });
+  }
+
+  if (updates.category && !BOOK_CATEGORIES.includes(updates.category)) {
+    return res.status(400).send({
+      message: `Category must be one of: ${BOOK_CATEGORIES.join(", ")}`,
+    });
+  }
+
+  const result = await bookCollection.updateOne(
+    { _id: new ObjectId(id) },
+    { $set: updates }
+  );
+
+  if (result.matchedCount === 0) {
+    return res.status(404).send({ message: "Book not found" });
+  }
+
+  res.json(result);
 });
 
 app.listen(PORT, () => {
