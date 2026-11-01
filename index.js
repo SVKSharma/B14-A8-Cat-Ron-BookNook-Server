@@ -1,21 +1,10 @@
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 
 const app = express();
-const port = process.env.PORT || 5000;
-
-app.use(cors());
-app.use(express.json());
-
-app.get("/", (req, res) => {
-  res.send("BookNook server is running");
-});
-
-app.listen(port, () => {
-  console.log(`BookNook server is running on port: ${port}`);
-});
+const PORT = process.env.PORT || 5000;
 
 const client = new MongoClient(process.env.MONGODB_CONNECTION_STRING_URI);
 
@@ -29,4 +18,151 @@ export async function connectToMongoDB() {
   }
 }
 
-connectToMongoDB();
+app.use(cors());
+app.use(express.json());
+
+const mongoClient = await connectToMongoDB();
+
+if (!mongoClient) {
+  console.error("Failed to connect to MongoDB. Shutting down...");
+  process.exit(1);
+}
+
+const db = mongoClient.db("booknook");
+const bookCollection = db.collection("books");
+const borrowCollection = db.collection("borrows");
+
+const BOOK_CATEGORIES = ["Fiction", "Science", "History", "Kids", "Others"];
+const BOOK_UPDATE_FIELDS = ["title", "author", "category", "image", "description"];
+
+app.get("/", (req, res) => {
+  res.send({ message: "Server is running fine!" });
+});
+
+app.get("/books", async (req, res) => {
+  const { limit, email } = req.query;
+  const query = email ? { addedByEmail: email } : {};
+  const cursor = bookCollection.find(query).sort({ createdAt: -1 });
+
+  const parsedLimit = Number.parseInt(limit, 10);
+  if (Number.isInteger(parsedLimit) && parsedLimit > 0) {
+    cursor.limit(parsedLimit);
+  }
+
+  const result = await cursor.toArray();
+  res.send(result);
+});
+
+app.get("/books/:id", async (req, res) => {
+  const { id } = req.params;
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid book id" });
+  }
+
+  const result = await bookCollection.findOne({ _id: new ObjectId(id) });
+
+  if (!result) {
+    return res.status(404).send({ message: "Book not found" });
+  }
+
+  res.send(result);
+});
+
+app.post("/books", async (req, res) => {
+  const data = req.body || {};
+
+  const requiredFields = [
+    "title",
+    "author",
+    "category",
+    "image",
+    "description",
+    "addedByName",
+    "addedByEmail",
+  ];
+
+  const missingFields = requiredFields.filter(
+    (field) => !data[field] || String(data[field]).trim() === ""
+  );
+
+  if (missingFields.length > 0) {
+    return res.status(400).send({
+      message: `Missing required fields: ${missingFields.join(", ")}`,
+    });
+  }
+
+  if (!BOOK_CATEGORIES.includes(data.category)) {
+    return res.status(400).send({
+      message: `Category must be one of: ${BOOK_CATEGORIES.join(", ")}`,
+    });
+  }
+
+  const newBook = {
+    title: String(data.title).trim(),
+    author: String(data.author).trim(),
+    category: data.category,
+    image: String(data.image).trim(),
+    description: String(data.description).trim(),
+    addedByName: String(data.addedByName).trim(),
+    addedByEmail: String(data.addedByEmail).trim(),
+    createdAt: new Date(),
+  };
+
+  const result = await bookCollection.insertOne(newBook);
+  res.status(201).send(result);
+});
+
+app.patch("/books/:id", async (req, res) => {
+  const { id } = req.params;
+  const data = req.body || {};
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid book id" });
+  }
+
+  const updates = {};
+
+  for (const field of BOOK_UPDATE_FIELDS) {
+    if (data[field] !== undefined && data[field] !== null) {
+      updates[field] = String(data[field]).trim();
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).send({
+      message: `Provide at least one field to update: ${BOOK_UPDATE_FIELDS.join(", ")}`,
+    });
+  }
+
+  const emptyFields = Object.entries(updates)
+    .filter(([, value]) => value === "")
+    .map(([field]) => field);
+
+  if (emptyFields.length > 0) {
+    return res.status(400).send({
+      message: `Fields cannot be empty: ${emptyFields.join(", ")}`,
+    });
+  }
+
+  if (updates.category && !BOOK_CATEGORIES.includes(updates.category)) {
+    return res.status(400).send({
+      message: `Category must be one of: ${BOOK_CATEGORIES.join(", ")}`,
+    });
+  }
+
+  const result = await bookCollection.updateOne(
+    { _id: new ObjectId(id) },
+    { $set: updates }
+  );
+
+  if (result.matchedCount === 0) {
+    return res.status(404).send({ message: "Book not found" });
+  }
+
+  res.json(result);
+});
+
+app.listen(PORT, () => {
+  console.log(`Server is running at ${PORT}`);
+});
