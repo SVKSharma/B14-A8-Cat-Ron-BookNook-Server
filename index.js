@@ -226,6 +226,22 @@ app.get("/borrows", async (req, res) => {
   res.send(result);
 });
 
+app.delete("/borrows/:id", async (req, res) => {
+  const { id } = req.params;
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: "Invalid borrow id" });
+  }
+
+  const result = await borrowCollection.deleteOne({ _id: new ObjectId(id) });
+
+  if (result.deletedCount === 0) {
+    return res.status(404).send({ message: "Borrow record not found" });
+  }
+
+  res.json(result);
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running at ${PORT}`);
 });
