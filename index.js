@@ -32,6 +32,8 @@ const db = mongoClient.db("booknook");
 const bookCollection = db.collection("books");
 const borrowCollection = db.collection("borrows");
 
+const BOOK_CATEGORIES = ["Fiction", "Science", "History", "Kids", "Others"];
+
 app.get("/", (req, res) => {
   res.send({ message: "Server is running fine!" });
 });
@@ -64,6 +66,50 @@ app.get("/books/:id", async (req, res) => {
   }
 
   res.send(result);
+});
+
+app.post("/books", async (req, res) => {
+  const data = req.body || {};
+
+  const requiredFields = [
+    "title",
+    "author",
+    "category",
+    "image",
+    "description",
+    "addedByName",
+    "addedByEmail",
+  ];
+
+  const missingFields = requiredFields.filter(
+    (field) => !data[field] || String(data[field]).trim() === ""
+  );
+
+  if (missingFields.length > 0) {
+    return res.status(400).send({
+      message: `Missing required fields: ${missingFields.join(", ")}`,
+    });
+  }
+
+  if (!BOOK_CATEGORIES.includes(data.category)) {
+    return res.status(400).send({
+      message: `Category must be one of: ${BOOK_CATEGORIES.join(", ")}`,
+    });
+  }
+
+  const newBook = {
+    title: String(data.title).trim(),
+    author: String(data.author).trim(),
+    category: data.category,
+    image: String(data.image).trim(),
+    description: String(data.description).trim(),
+    addedByName: String(data.addedByName).trim(),
+    addedByEmail: String(data.addedByEmail).trim(),
+    createdAt: new Date(),
+  };
+
+  const result = await bookCollection.insertOne(newBook);
+  res.status(201).send(result);
 });
 
 app.listen(PORT, () => {
