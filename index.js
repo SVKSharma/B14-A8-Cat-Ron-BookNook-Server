@@ -10,7 +10,12 @@ if (!configuredClientUrl) throw new Error("CLIENT_URL must be configured in the 
 const BETTER_AUTH_BASE_URL = configuredClientUrl.replace(/\/$/, "");
 const AUTH_JWKS = createRemoteJWKSet(new URL(`${BETTER_AUTH_BASE_URL}/api/auth/jwks`));
 
-const client = new MongoClient(process.env.MONGODB_CONNECTION_STRING_URI);
+const client = new MongoClient(process.env.MONGODB_CONNECTION_STRING_URI, {
+  maxPoolSize: 5,
+  maxConnecting: 2,
+  maxIdleTimeMS: 30_000,
+  serverSelectionTimeoutMS: 10_000,
+});
 
 async function connectToMongoDB() {
   try {
