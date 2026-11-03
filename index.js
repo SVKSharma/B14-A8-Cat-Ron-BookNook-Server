@@ -2,9 +2,12 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const BETTER_AUTH_BASE_URL = (process.env.BETTER_AUTH_URL || "http://localhost:3000").replace(/\/$/, "");
+const AUTH_JWKS = createRemoteJWKSet(new URL(`${BETTER_AUTH_BASE_URL}/api/auth/jwks`));
 
 const client = new MongoClient(process.env.MONGODB_CONNECTION_STRING_URI);
 
@@ -35,6 +38,53 @@ const borrowCollection = db.collection("borrows");
 const BOOK_CATEGORIES = ["Fiction", "Science", "History", "Kids", "Others"];
 const BOOK_UPDATE_FIELDS = ["title", "author", "category", "isbn", "image", "description"];
 
+function ownerFilter(email) {
+  return {
+    $expr: {
+      $eq: [
+        { $toLower: { $ifNull: ["$addedByEmail", ""] } },
+        String(email).trim().toLowerCase(),
+      ],
+    },
+  };
+}
+
+async function requireAuth(req, res, next) {
+  const authorization = req.get("authorization") || "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return res.status(401).send({ message: "Access denied: unauthorized request. A valid bearer token is required." });
+  }
+
+  try {
+    const { payload } = await jwtVerify(match[1], AUTH_JWKS, {
+      issuer: BETTER_AUTH_BASE_URL,
+      audience: BETTER_AUTH_BASE_URL,
+      algorithms: ["EdDSA"],
+    });
+    if (typeof payload.sub !== "string" || typeof payload.email !== "string" || !payload.email.trim()) {
+      return res.status(401).send({ message: "Access denied: unauthorized request. The token has no valid user identity." });
+    }
+
+    req.auth = {
+      userId: payload.sub,
+      email: payload.email.trim(),
+      name: typeof payload.name === "string" ? payload.name.trim() : payload.email.trim(),
+    };
+    return next();
+  } catch {
+    return res.status(401).send({ message: "Access denied: unauthorized request. The token is invalid or expired." });
+  }
+}
+
+function forbidDifferentEmail(req, res, email) {
+  if (email && String(email).trim().toLowerCase() !== req.auth.email.toLowerCase()) {
+    res.status(403).send({ message: "Forbidden. You can only access your own account data." });
+    return true;
+  }
+  return false;
+}
+
 function compactIsbn(value) {
   return String(value ?? "").replace(/[\s-]/g, "");
 }
@@ -52,10 +102,12 @@ app.get("/", (req, res) => {
   res.send({ message: "Server is running fine!" });
 });
 
-app.get("/books", async (req, res) => {
+app.get("/books", (req, res, next) => req.query.email ? requireAuth(req, res, next) : next(), async (req, res) => {
   const { limit, email } = req.query;
-  const query = email ? { addedByEmail: email } : {};
+  if (forbidDifferentEmail(req, res, email)) return;
+  const query = email ? ownerFilter(req.auth.email) : {};
   const cursor = bookCollection.find(query).sort({ createdAt: -1 });
+  if (!email) cursor.project({ addedByEmail: 0 });
 
   const parsedLimit = Number.parseInt(limit, 10);
   if (Number.isInteger(parsedLimit) && parsedLimit > 0) {
@@ -66,14 +118,19 @@ app.get("/books", async (req, res) => {
   res.send(result);
 });
 
-app.get("/books/:id", async (req, res) => {
+app.get("/books/:id", (req, res, next) => req.query.owner === "true" ? requireAuth(req, res, next) : next(), async (req, res) => {
   const { id } = req.params;
 
   if (!ObjectId.isValid(id)) {
     return res.status(400).send({ message: "Invalid book id" });
   }
 
-  const result = await bookCollection.findOne({ _id: new ObjectId(id) });
+  const query = { _id: new ObjectId(id) };
+  if (req.query.owner === "true") Object.assign(query, ownerFilter(req.auth.email));
+  const result = await bookCollection.findOne(
+    query,
+    req.query.owner === "true" ? undefined : { projection: { addedByEmail: 0 } }
+  );
 
   if (!result) {
     return res.status(404).send({ message: "Book not found" });
@@ -82,7 +139,7 @@ app.get("/books/:id", async (req, res) => {
   res.send(result);
 });
 
-app.post("/books", async (req, res) => {
+app.post("/books", requireAuth, async (req, res) => {
   const data = req.body || {};
 
   const requiredFields = [
@@ -92,8 +149,6 @@ app.post("/books", async (req, res) => {
     "category",
     "image",
     "description",
-    "addedByName",
-    "addedByEmail",
   ];
 
   const missingFields = requiredFields.filter(
@@ -117,7 +172,7 @@ app.post("/books", async (req, res) => {
     return res.status(400).send({ message: "ISBN must contain exactly 13 digits" });
   }
 
-  const ownerEmail = String(data.addedByEmail).trim();
+  const ownerEmail = req.auth.email;
   const normalizedOwnerEmail = ownerEmail.toLowerCase();
   const title = String(data.title).trim();
   const author = String(data.author).trim();
@@ -133,7 +188,7 @@ app.post("/books", async (req, res) => {
     });
   }
 
-  const ownerBooks = await bookCollection.find({ addedByEmail: ownerEmail }).toArray();
+  const ownerBooks = await bookCollection.find(ownerFilter(ownerEmail)).toArray();
   const duplicateForOwner = ownerBooks.find((book) => {
     const sameTitleAndAuthor = normalizeBookText(book.title) === normalizeBookText(title) &&
       normalizeBookText(book.author) === normalizeBookText(author);
@@ -158,7 +213,7 @@ app.post("/books", async (req, res) => {
     category: data.category,
     image: String(data.image).trim(),
     description: String(data.description).trim(),
-    addedByName: String(data.addedByName).trim(),
+    addedByName: req.auth.name,
     addedByEmail: ownerEmail,
     createdAt: new Date(),
   };
@@ -167,7 +222,7 @@ app.post("/books", async (req, res) => {
   res.status(201).send(result);
 });
 
-app.patch("/books/:id", async (req, res) => {
+app.patch("/books/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
   const data = req.body || {};
 
@@ -213,8 +268,47 @@ app.patch("/books/:id", async (req, res) => {
     updates.isbn = normalizedIsbn;
   }
 
+  const currentBook = await bookCollection.findOne({ _id: new ObjectId(id), ...ownerFilter(req.auth.email) });
+  if (!currentBook) {
+    return res.status(404).send({ message: "Book not found" });
+  }
+
+  const nextTitle = updates.title ?? currentBook.title;
+  const nextAuthor = updates.author ?? currentBook.author;
+  const nextIsbn = updates.isbn ?? currentBook.isbn;
+  if (nextIsbn) {
+    const sameIsbnBooks = await bookCollection.find({
+      isbn: normalizeIsbn(nextIsbn),
+      _id: { $ne: new ObjectId(id) },
+    }).toArray();
+    const isbnConflict = sameIsbnBooks.find((candidate) =>
+      normalizeBookText(candidate.title) !== normalizeBookText(nextTitle) ||
+      normalizeBookText(candidate.author) !== normalizeBookText(nextAuthor)
+    );
+    if (isbnConflict) {
+      return res.status(409).send({
+        message: `This ISBN is already linked to “${isbnConflict.title}” by ${isbnConflict.author}. Did you mean “${isbnConflict.title}”? Check the ISBN or book details.`,
+      });
+    }
+  }
+
+  const ownerBooks = await bookCollection.find({
+    ...ownerFilter(req.auth.email),
+    _id: { $ne: new ObjectId(id) },
+  }).toArray();
+  const duplicate = ownerBooks.find((candidate) => {
+    if (nextIsbn && candidate.isbn) return normalizeIsbn(candidate.isbn) === normalizeIsbn(nextIsbn);
+    return normalizeBookText(candidate.title) === normalizeBookText(nextTitle) &&
+      normalizeBookText(candidate.author) === normalizeBookText(nextAuthor);
+  });
+  if (duplicate) {
+    return res.status(409).send({
+      message: `“${duplicate.title}” by ${duplicate.author} is already in your listings. Edit that listing instead.`,
+    });
+  }
+
   const result = await bookCollection.updateOne(
-    { _id: new ObjectId(id) },
+    { _id: new ObjectId(id), ...ownerFilter(req.auth.email) },
     { $set: updates }
   );
 
@@ -225,14 +319,14 @@ app.patch("/books/:id", async (req, res) => {
   res.json(result);
 });
 
-app.delete("/books/:id", async (req, res) => {
+app.delete("/books/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
 
   if (!ObjectId.isValid(id)) {
     return res.status(400).send({ message: "Invalid book id" });
   }
 
-  const result = await bookCollection.deleteOne({ _id: new ObjectId(id) });
+  const result = await bookCollection.deleteOne({ _id: new ObjectId(id), ...ownerFilter(req.auth.email) });
 
   if (result.deletedCount === 0) {
     return res.status(404).send({ message: "Book not found" });
@@ -241,21 +335,26 @@ app.delete("/books/:id", async (req, res) => {
   res.json(result);
 });
 
-app.post("/borrows", async (req, res) => {
+app.post("/borrows", requireAuth, async (req, res) => {
   const data = req.body || {};
-  const { bookId, userEmail, returnDate } = data;
+  const { bookId, returnDate } = data;
 
   if (!bookId || !ObjectId.isValid(bookId)) {
     return res.status(400).send({ message: "Invalid or missing book id" });
   }
 
-  if (!userEmail || String(userEmail).trim() === "") {
-    return res.status(400).send({ message: "User email is required" });
-  }
-
   const book = await bookCollection.findOne({ _id: new ObjectId(bookId) });
   if (!book) {
     return res.status(404).send({ message: "Book not found" });
+  }
+
+  if (String(book.addedByEmail).trim().toLowerCase() === req.auth.email.toLowerCase()) {
+    return res.status(403).send({ message: "You can’t borrow a book from your own shelf." });
+  }
+
+  const existingBorrow = await borrowCollection.findOne({ bookId: new ObjectId(bookId), userEmail: req.auth.email });
+  if (existingBorrow) {
+    return res.status(409).send({ message: "You already have this book borrowed. Return it before borrowing it again." });
   }
 
   const parsedReturnDate = returnDate ? new Date(returnDate) : null;
@@ -266,9 +365,9 @@ app.post("/borrows", async (req, res) => {
 
   const newBorrow = {
     bookId: new ObjectId(bookId),
-    bookTitle: data.bookTitle ? String(data.bookTitle).trim() : book.title,
-    bookImage: data.bookImage ? String(data.bookImage).trim() : book.image,
-    userEmail: String(userEmail).trim(),
+    bookTitle: book.title,
+    bookImage: book.image,
+    userEmail: req.auth.email,
     borrowDate: new Date(),
     returnDate: validReturnDate,
   };
@@ -277,9 +376,10 @@ app.post("/borrows", async (req, res) => {
   res.status(201).send(result);
 });
 
-app.get("/borrows", async (req, res) => {
+app.get("/borrows", requireAuth, async (req, res) => {
   const { email } = req.query;
-  const query = email ? { userEmail: email } : {};
+  if (forbidDifferentEmail(req, res, email)) return;
+  const query = { userEmail: req.auth.email };
   const result = await borrowCollection
     .find(query)
     .sort({ borrowDate: -1 })
@@ -288,14 +388,14 @@ app.get("/borrows", async (req, res) => {
   res.send(result);
 });
 
-app.delete("/borrows/:id", async (req, res) => {
+app.delete("/borrows/:id", requireAuth, async (req, res) => {
   const { id } = req.params;
 
   if (!ObjectId.isValid(id)) {
     return res.status(400).send({ message: "Invalid borrow id" });
   }
 
-  const result = await borrowCollection.deleteOne({ _id: new ObjectId(id) });
+  const result = await borrowCollection.deleteOne({ _id: new ObjectId(id), userEmail: req.auth.email });
 
   if (result.deletedCount === 0) {
     return res.status(404).send({ message: "Borrow record not found" });
