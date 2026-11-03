@@ -33,7 +33,20 @@ const bookCollection = db.collection("books");
 const borrowCollection = db.collection("borrows");
 
 const BOOK_CATEGORIES = ["Fiction", "Science", "History", "Kids", "Others"];
-const BOOK_UPDATE_FIELDS = ["title", "author", "category", "image", "description"];
+const BOOK_UPDATE_FIELDS = ["title", "author", "category", "isbn", "image", "description"];
+
+function compactIsbn(value) {
+  return String(value ?? "").replace(/[\s-]/g, "");
+}
+
+function normalizeIsbn(value) {
+  const isbn = compactIsbn(value);
+  return /^\d{13}$/.test(isbn) ? isbn : null;
+}
+
+function normalizeBookText(value) {
+  return String(value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase();
+}
 
 app.get("/", (req, res) => {
   res.send({ message: "Server is running fine!" });
@@ -75,6 +88,7 @@ app.post("/books", async (req, res) => {
   const requiredFields = [
     "title",
     "author",
+    "isbn",
     "category",
     "image",
     "description",
@@ -98,14 +112,54 @@ app.post("/books", async (req, res) => {
     });
   }
 
+  const isbn = data.isbn ? normalizeIsbn(data.isbn) : "";
+  if (data.isbn && !isbn) {
+    return res.status(400).send({ message: "ISBN must contain exactly 13 digits" });
+  }
+
+  const ownerEmail = String(data.addedByEmail).trim();
+  const normalizedOwnerEmail = ownerEmail.toLowerCase();
+  const title = String(data.title).trim();
+  const author = String(data.author).trim();
+  const sameIsbnBooks = isbn ? await bookCollection.find({ isbn }).toArray() : [];
+  const isbnConflict = sameIsbnBooks.find(
+    (book) => normalizeBookText(book.title) !== normalizeBookText(title) ||
+      normalizeBookText(book.author) !== normalizeBookText(author)
+  );
+
+  if (isbnConflict) {
+    return res.status(409).send({
+      message: `This ISBN is already linked to “${isbnConflict.title}” by ${isbnConflict.author}. Did you mean “${isbnConflict.title}”? Check the ISBN and book details.`,
+    });
+  }
+
+  const ownerBooks = await bookCollection.find({ addedByEmail: ownerEmail }).toArray();
+  const duplicateForOwner = ownerBooks.find((book) => {
+    const sameTitleAndAuthor = normalizeBookText(book.title) === normalizeBookText(title) &&
+      normalizeBookText(book.author) === normalizeBookText(author);
+    const bothHaveIsbn = Boolean(isbn && book.isbn);
+    return bothHaveIsbn
+      ? compactIsbn(book.isbn) === isbn
+      : sameTitleAndAuthor;
+  }) ?? sameIsbnBooks.find(
+    (book) => String(book.addedByEmail).trim().toLowerCase() === normalizedOwnerEmail
+  );
+
+  if (duplicateForOwner) {
+    return res.status(409).send({
+      message: `“${duplicateForOwner.title}” by ${duplicateForOwner.author} is already in your listings. A duplicate listing was not created.`,
+    });
+  }
+
   const newBook = {
-    title: String(data.title).trim(),
-    author: String(data.author).trim(),
+    ...(isbn ? { isbn } : {}),
+    title,
+    author,
     category: data.category,
     image: String(data.image).trim(),
     description: String(data.description).trim(),
     addedByName: String(data.addedByName).trim(),
-    addedByEmail: String(data.addedByEmail).trim(),
+    addedByEmail: ownerEmail,
     createdAt: new Date(),
   };
 
@@ -149,6 +203,14 @@ app.patch("/books/:id", async (req, res) => {
     return res.status(400).send({
       message: `Category must be one of: ${BOOK_CATEGORIES.join(", ")}`,
     });
+  }
+
+  if (updates.isbn) {
+    const normalizedIsbn = normalizeIsbn(updates.isbn);
+    if (!normalizedIsbn) {
+      return res.status(400).send({ message: "ISBN must contain exactly 13 digits" });
+    }
+    updates.isbn = normalizedIsbn;
   }
 
   const result = await bookCollection.updateOne(
