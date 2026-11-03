@@ -5,8 +5,6 @@ import { MongoClient, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
-const PORT = process.env.PORT;
-if (!PORT) throw new Error("PORT must be configured in the backend environment.");
 const configuredClientUrl = process.env.CLIENT_URL;
 if (!configuredClientUrl) throw new Error("CLIENT_URL must be configured in the backend environment.");
 const BETTER_AUTH_BASE_URL = configuredClientUrl.replace(/\/$/, "");
@@ -14,7 +12,7 @@ const AUTH_JWKS = createRemoteJWKSet(new URL(`${BETTER_AUTH_BASE_URL}/api/auth/j
 
 const client = new MongoClient(process.env.MONGODB_CONNECTION_STRING_URI);
 
-export async function connectToMongoDB() {
+async function connectToMongoDB() {
   try {
     await client.connect();
     console.log("You successfully connected to MongoDB!");
@@ -407,6 +405,4 @@ app.delete("/borrows/:id", requireAuth, async (req, res) => {
   res.json(result);
 });
 
-app.listen(PORT, () => {
-  console.log(`Server is running at ${PORT}`);
-});
+export default app;
