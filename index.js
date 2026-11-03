@@ -99,6 +99,25 @@ function normalizeBookText(value) {
   return String(value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+async function initializeBookInventory(bookGroup) {
+  const uninitializedCopies = await bookCollection.find(
+    { ...bookGroup, availableCopies: { $exists: false } },
+    { projection: { _id: 1 } }
+  ).toArray();
+  if (uninitializedCopies.length === 0) return;
+
+  const copyIds = uninitializedCopies.map((copy) => copy._id);
+  const borrowedCopyIds = new Set(
+    (await borrowCollection.distinct("bookId", { bookId: { $in: copyIds } })).map(String)
+  );
+  await Promise.all(uninitializedCopies.map((copy) =>
+    bookCollection.updateOne(
+      { _id: copy._id, availableCopies: { $exists: false } },
+      { $set: { availableCopies: borrowedCopyIds.has(String(copy._id)) ? 0 : 1 } }
+    )
+  ));
+}
+
 app.get("/", (req, res) => {
   res.send({ message: "Server is running fine!" });
 });
@@ -138,6 +157,31 @@ app.get("/books/:id", (req, res, next) => req.query.owner === "true" ? requireAu
   }
 
   res.send(result);
+});
+
+app.get("/books/:id/availability", (req, res, next) => req.get("authorization") ? requireAuth(req, res, next) : next(), async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid book id" });
+  const book = await bookCollection.findOne({ _id: new ObjectId(id) }, { projection: { isbn: 1 } });
+  if (!book) return res.status(404).send({ message: "Book not found" });
+
+  const bookGroup = book.isbn ? { isbn: book.isbn } : { _id: book._id };
+  await initializeBookInventory(bookGroup);
+  const copies = await bookCollection.find(bookGroup, { projection: { availableCopies: 1, addedByEmail: 1 } }).toArray();
+  const ownsBook = req.auth
+    ? Boolean(await bookCollection.findOne({ ...bookGroup, ...ownerFilter(req.auth.email) }, { projection: { _id: 1 } }))
+    : false;
+  const countCopies = (listings) => listings.reduce(
+    (total, copy) => total + Math.max(0, Number(copy.availableCopies ?? 0)),
+    0
+  );
+  const availableCopies = countCopies(copies);
+  const borrowableCopies = req.auth
+    ? countCopies(copies.filter((copy) =>
+      String(copy.addedByEmail ?? "").trim().toLowerCase() !== req.auth.email.toLowerCase()
+    ))
+    : availableCopies;
+  res.send({ availableCopies, borrowableCopies, ownsBook });
 });
 
 app.post("/books", requireAuth, async (req, res) => {
@@ -214,6 +258,7 @@ app.post("/books", requireAuth, async (req, res) => {
     category: data.category,
     image: String(data.image).trim(),
     description: String(data.description).trim(),
+    availableCopies: 1,
     addedByName: req.auth.name,
     addedByEmail: ownerEmail,
     createdAt: new Date(),
@@ -349,13 +394,57 @@ app.post("/borrows", requireAuth, async (req, res) => {
     return res.status(404).send({ message: "Book not found" });
   }
 
-  if (String(book.addedByEmail).trim().toLowerCase() === req.auth.email.toLowerCase()) {
-    return res.status(403).send({ message: "You can’t borrow a book from your own shelf." });
+  const bookGroup = book.isbn ? { isbn: book.isbn } : { _id: book._id };
+  const ownsBook = await bookCollection.findOne(
+    { ...bookGroup, ...ownerFilter(req.auth.email) },
+    { projection: { _id: 1 } }
+  );
+  if (ownsBook) {
+    return res.status(403).send({ message: "You can’t borrow a book you’ve shared with the community." });
   }
 
-  const existingBorrow = await borrowCollection.findOne({ bookId: new ObjectId(bookId), userEmail: req.auth.email });
+  const groupBooks = await bookCollection.find(bookGroup, { projection: { _id: 1 } }).toArray();
+  const groupBookIds = groupBooks.map((copy) => copy._id);
+  const existingBorrowQuery = { userEmail: req.auth.email };
+  if (book.isbn) {
+    existingBorrowQuery.$or = [
+      { isbn: book.isbn },
+      { bookId: { $in: groupBookIds } },
+    ];
+  } else {
+    existingBorrowQuery.bookId = new ObjectId(bookId);
+  }
+  const existingBorrow = await borrowCollection.findOne(existingBorrowQuery);
   if (existingBorrow) {
     return res.status(409).send({ message: "You already have this book borrowed. Return it before borrowing it again." });
+  }
+
+  await initializeBookInventory(bookGroup);
+  const eligibleBorrower = { $nor: [ownerFilter(req.auth.email)] };
+  let borrowedBook = await bookCollection.findOneAndUpdate(
+    {
+      _id: new ObjectId(bookId),
+      availableCopies: { $gt: 0 },
+      ...eligibleBorrower,
+    },
+    { $inc: { availableCopies: -1 } }
+  );
+  if (!borrowedBook && book.isbn) {
+    borrowedBook = await bookCollection.findOneAndUpdate(
+      {
+        ...bookGroup,
+        _id: { $ne: new ObjectId(bookId) },
+        availableCopies: { $gt: 0 },
+        ...eligibleBorrower,
+      },
+      { $inc: { availableCopies: -1 } }
+    );
+  }
+  if (!borrowedBook) {
+    if (!book.isbn && String(book.addedByEmail).trim().toLowerCase() === req.auth.email.toLowerCase()) {
+      return res.status(403).send({ message: "You can’t borrow a book from your own shelf." });
+    }
+    return res.status(409).send({ message: "All copies are currently borrowed. Check back soon; returned books become available here." });
   }
 
   const parsedReturnDate = returnDate ? new Date(returnDate) : null;
@@ -365,16 +454,22 @@ app.post("/borrows", requireAuth, async (req, res) => {
       : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
   const newBorrow = {
-    bookId: new ObjectId(bookId),
-    bookTitle: book.title,
-    bookImage: book.image,
+    bookId: borrowedBook._id,
+    ...(book.isbn ? { isbn: book.isbn } : {}),
+    bookTitle: borrowedBook.title,
+    bookImage: borrowedBook.image,
     userEmail: req.auth.email,
     borrowDate: new Date(),
     returnDate: validReturnDate,
   };
 
-  const result = await borrowCollection.insertOne(newBorrow);
-  res.status(201).send(result);
+  try {
+    const result = await borrowCollection.insertOne(newBorrow);
+    res.status(201).send(result);
+  } catch (error) {
+    await bookCollection.updateOne({ _id: borrowedBook._id }, { $inc: { availableCopies: 1 } });
+    throw error;
+  }
 });
 
 app.get("/borrows", requireAuth, async (req, res) => {
@@ -386,7 +481,19 @@ app.get("/borrows", requireAuth, async (req, res) => {
     .sort({ borrowDate: -1 })
     .toArray();
 
-  res.send(result);
+  const legacyBorrowIds = result
+    .filter((borrow) => !borrow.isbn)
+    .map((borrow) => borrow.bookId);
+  const legacyBooks = legacyBorrowIds.length
+    ? await bookCollection.find({ _id: { $in: legacyBorrowIds } }, { projection: { isbn: 1 } }).toArray()
+    : [];
+  const isbnByBookId = new Map(legacyBooks.map((book) => [String(book._id), book.isbn]));
+  res.send(result.map((borrow) => ({
+    ...borrow,
+    ...(borrow.isbn || isbnByBookId.get(String(borrow.bookId))
+      ? { bookIsbn: borrow.isbn ?? isbnByBookId.get(String(borrow.bookId)) }
+      : {}),
+  })));
 });
 
 app.delete("/borrows/:id", requireAuth, async (req, res) => {
@@ -396,10 +503,15 @@ app.delete("/borrows/:id", requireAuth, async (req, res) => {
     return res.status(400).send({ message: "Invalid borrow id" });
   }
 
-  const result = await borrowCollection.deleteOne({ _id: new ObjectId(id), userEmail: req.auth.email });
+  const borrow = await borrowCollection.findOne({ _id: new ObjectId(id), userEmail: req.auth.email });
 
-  if (result.deletedCount === 0) {
+  if (!borrow) {
     return res.status(404).send({ message: "Borrow record not found" });
+  }
+
+  const result = await borrowCollection.deleteOne({ _id: borrow._id, userEmail: req.auth.email });
+  if (result.deletedCount > 0) {
+    await bookCollection.updateOne({ _id: borrow.bookId }, { $inc: { availableCopies: 1 } });
   }
 
   res.json(result);
