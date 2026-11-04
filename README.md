@@ -1,7 +1,7 @@
 <div align="center">
 
 <h1 style="font-size: 3rem; font-weight: 800;">
-	📚 BookNook API / <font color="#315b45">A small online library</font>
+	<img src="https://b14-a8-cat-ron-book-nook-client-svk.vercel.app/icon.svg" width="48" height="48" alt="BookNook icon" style="vertical-align: middle; margin-right: 0.3em;" /> BookNook API / <font color="#315b45">A small online library</font>
 </h1>
 
 <h3 style="font-size: 1.1rem; font-weight: 700;"><font color="#315b45">B14-A8 · Cat_Ron · Express + MongoDB API</font></h3>
